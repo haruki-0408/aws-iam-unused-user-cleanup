@@ -122,7 +122,7 @@ aws ssm put-parameter \
 - Python 3.13ランタイムの定期的な更新が必要な場合があります
 - Lambda関数のタイムアウトやメモリサイズは必要に応じて調整可能です
 - 日時計算はすべてUTC（協定世界時）基準で行われ、修復アクションと統一されています
-- 修復アクションはSSM Document `AWSConfigRemediation-RevokeUnusedIAMUserCredentials` バージョン5で固定されており、検知ロジックと完全に一致します
+- 修復アクションはSSM Document `AWSConfigRemediation-RevokeUnusedIAMUserCredentials` バージョン5で固定されており、検知ロジックがこのバージョンに完全に一致するように組まれています。バージョンが変わると修復ドキュメントのスクリプトが破壊的変更になる可能性があり検知ロジックとズレる可能性があるのでバージョンを上げる際は注意してください。
 
 ## 動作フロー
 
