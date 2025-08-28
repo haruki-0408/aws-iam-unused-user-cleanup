@@ -102,8 +102,8 @@ aws ssm put-parameter \
 ユーザー名が除外リストに含まれている場合、使用状況に関係なくCOMPLIANTと判定
 
 #### パスワード有効性判定
-- **使用履歴がある場合**: 最終使用日が設定期間内であれば有効
-- **未使用の場合**: 作成日が設定期間内であれば有効
+- **使用履歴がある場合**: 最終使用日が設定期間内であれば有効、期間超過で無効
+- **未使用の場合**: 作成日が設定期間内であれば有効、期間超過で無効
 - **パスワード未設定の場合**: 有効とみなす（検知対象外）
 
 #### アクセスキー有効性判定
@@ -122,6 +122,7 @@ aws ssm put-parameter \
 - Python 3.13ランタイムの定期的な更新が必要な場合があります
 - Lambda関数のタイムアウトやメモリサイズは必要に応じて調整可能です
 - 日時計算はすべてUTC（協定世界時）基準で行われ、修復アクションと統一されています
+- 修復アクションはSSM Document `AWSConfigRemediation-RevokeUnusedIAMUserCredentials` バージョン5で固定されており、検知ロジックと完全に一致します
 
 ## 動作フロー
 
@@ -152,7 +153,7 @@ aws ssm put-parameter \
 aws cloudformation deploy \
   --stack-name IamUnusedUserCleanup \
   --template-file templates/template.yaml \
-  --capabilities CAPABILITY_NAMED_IAM \
+  --capabilities CAPABILITY_NAMED_IAM 
 ```
 
 ### 3. 除外ユーザーリストの設定

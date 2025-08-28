@@ -94,7 +94,7 @@ Resources:
                           'ComplianceResourceType': 'AWS::IAM::User',
                           'ComplianceResourceId': user['UserId'],
                           'ComplianceType': compliance,
-                          'OrderingTimestamp': datetime.now()
+                          'OrderingTimestamp': datetime.now(timezone.utc)
                       })
               
               # Config に評価結果を送信
@@ -120,7 +120,7 @@ Resources:
                   return []
           
           def is_credentials_unused(user_name, max_days):
-              cutoff_date = datetime.now() - timedelta(days=max_days)
+              cutoff_date = datetime.now(timezone.utc) - timedelta(days=max_days)
               print(f"カットオフ日: {cutoff_date}")
               
               password_valid = False
@@ -134,15 +134,19 @@ Resources:
                   if last_used > cutoff_date:
                       print(f"パスワード使用中: {user_name}")
                       password_valid = True
+                  else:
+                      print(f"パスワード使用期間超過: {user_name}")
               else:
                   # パスワード未使用の場合、作成日をチェック
                   try:
                       login_profile = iam.get_login_profile(UserName=user_name)
-                      create_date = login_profile['LoginProfile']['CreateDate']
+                      create_date = login_profile['LoginProfile']['CreateDate'].replace(tzinfo=timezone.utc)
                       print(f"パスワード作成日: {create_date}")
                       if create_date > cutoff_date:
                           print(f"パスワード作成日内: {user_name}")
                           password_valid = True
+                      else:
+                          print(f"パスワード作成期間超過: {user_name}")
                   except iam.exceptions.NoSuchEntityException:
                       print(f"ログインプロファイルなし: {user_name}")
                       password_valid = True  # パスワードがない場合は有効とみなす
@@ -172,6 +176,8 @@ Resources:
                               # アクセスキー未使用の場合、作成日をチェック
                               create_date = key['CreateDate']
                               print(f"アクセスキー作成日: {create_date}")
+                              print(f"アクセスキー作成日の型: {type(create_date)}")
+                              print(f"アクセスキー作成日の値: {create_date}")
                               if create_date > cutoff_date:
                                   print(f"アクセスキー作成日内: {user_name}")
                                   access_key_valid = True
@@ -248,7 +254,7 @@ Resources:
       ConfigRuleName: !Ref ConfigRule
       TargetType: SSM_DOCUMENT
       TargetId: AWSConfigRemediation-RevokeUnusedIAMUserCredentials
-      TargetVersion: "1"
+      TargetVersion: "5"
       Parameters:
         AutomationAssumeRole:
           StaticValue:
