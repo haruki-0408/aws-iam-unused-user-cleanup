@@ -123,67 +123,68 @@ Resources:
               cutoff_date = datetime.now(timezone.utc) - timedelta(days=max_days)
               print(f"カットオフ日: {cutoff_date}")
               
-              password_valid = False
-              access_key_valid = False
-              
-              # パスワード使用チェック
+              # パスワード使用チェック（修復ロジックに合わせて）
               user_info = iam.get_user(UserName=user_name)
-              if 'PasswordLastUsed' in user_info['User']:
-                  last_used = user_info['User']['PasswordLastUsed']
-                  print(f"パスワード最終使用: {last_used}")
-                  if last_used > cutoff_date:
-                      print(f"パスワード使用中: {user_name}")
-                      password_valid = True
-                  else:
-                      print(f"パスワード使用期間超過: {user_name}")
-              else:
-                  # パスワード未使用の場合、作成日をチェック
-                  try:
-                      login_profile = iam.get_login_profile(UserName=user_name)
-                      create_date = login_profile['LoginProfile']['CreateDate'].replace(tzinfo=timezone.utc)
-                      print(f"パスワード作成日: {create_date}")
-                      if create_date > cutoff_date:
-                          print(f"パスワード作成日内: {user_name}")
-                          password_valid = True
-                      else:
-                          print(f"パスワード作成期間超過: {user_name}")
-                  except iam.exceptions.NoSuchEntityException:
-                      print(f"ログインプロファイルなし: {user_name}")
-                      password_valid = True  # パスワードがない場合は有効とみなす
+              password_valid = True  # デフォルトは有効
               
-              # アクセスキー使用チェック
+              try:
+                  login_profile = iam.get_login_profile(UserName=user_name)
+                  password_needs_remediation = False
+                  
+                  if 'PasswordLastUsed' in user_info['User']:
+                      last_used = user_info['User']['PasswordLastUsed']
+                      last_used_days = (datetime.now(timezone.utc) - last_used).days
+                      print(f"パスワード最終使用: {last_used} ({last_used_days}日前)")
+                      if last_used_days >= max_days:
+                          password_needs_remediation = True
+                  else:
+                      # パスワード未使用の場合、作成日をチェック
+                      create_date = login_profile['LoginProfile']['CreateDate'].replace(tzinfo=timezone.utc)
+                      create_days = (datetime.now(timezone.utc) - create_date).days
+                      print(f"パスワード作成日: {create_date} ({create_days}日前)")
+                      if create_days >= max_days:
+                          password_needs_remediation = True
+                  
+                  if password_needs_remediation:
+                      print(f"期間超過パスワード検出: {user_name}")
+                      password_valid = False
+                      
+              except iam.exceptions.NoSuchEntityException:
+                  print(f"ログインプロファイルなし: {user_name}")
+                  # パスワードがない場合は有効とみなす（修復対象外）
+              
+              # アクセスキー使用チェック（修復ロジックに合わせて個別評価）
               access_keys = iam.list_access_keys(UserName=user_name)
+              access_key_valid = True  # デフォルトは有効
+              
               if not access_keys['AccessKeyMetadata']:
-                  access_key_valid = True  # アクセスキーがない場合は有効とみなす
                   print(f"アクセスキーなし: {user_name}")
               else:
-                  # アクティブキーの存在確認
-                  active_keys = [key for key in access_keys['AccessKeyMetadata'] if key['Status'] == 'Active']
-                  if not active_keys:
-                      access_key_valid = True  # 全キーInactive = 対象外
-                      print(f"全キーInactive: {user_name}")
-                  else:
-                      for key in active_keys:
+                  for key in access_keys['AccessKeyMetadata']:
+                      if key['Status'] == 'Active':  # Activeキーのみチェック
                           key_usage = iam.get_access_key_last_used(AccessKeyId=key['AccessKeyId'])
+                          key_needs_remediation = False
+                          
                           if 'LastUsedDate' in key_usage['AccessKeyLastUsed']:
                               last_used = key_usage['AccessKeyLastUsed']['LastUsedDate']
-                              print(f"アクセスキー最終使用: {last_used}")
-                              if last_used > cutoff_date:
-                                  print(f"アクセスキー使用中: {user_name}")
-                                  access_key_valid = True
-                                  break
+                              last_used_days = (datetime.now(timezone.utc) - last_used).days
+                              print(f"アクセスキー最終使用: {last_used} ({last_used_days}日前)")
+                              if last_used_days >= max_days:
+                                  key_needs_remediation = True
                           else:
                               # アクセスキー未使用の場合、作成日をチェック
                               create_date = key['CreateDate']
-                              print(f"アクセスキー作成日: {create_date}")
-                              if create_date > cutoff_date:
-                                  print(f"アクセスキー作成日内: {user_name}")
-                                  access_key_valid = True
-                                  break
-                              print(f"アクセスキー未使用: {key['AccessKeyId']}")
+                              create_days = (datetime.now(timezone.utc) - create_date).days
+                              print(f"アクセスキー作成日: {create_date} ({create_days}日前)")
+                              if create_days >= max_days:
+                                  key_needs_remediation = True
+                          
+                          if key_needs_remediation:
+                              print(f"期間超過アクセスキー検出: {key['AccessKeyId']}")
+                              access_key_valid = False  # 一つでも期間超過があれば無効
               
-              # AND条件: 両方とも有効でない場合はNON_COMPLIANT
-              result = not (password_valid and access_key_valid)
+              # OR条件: どちらか一方でも無効（修復が必要）な場合はNON_COMPLIANT
+              result = not password_valid or not access_key_valid
               print(f"パスワード有効: {password_valid}, アクセスキー有効: {access_key_valid}, 未使用判定: {result}")
               return result
 
