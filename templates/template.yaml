@@ -176,8 +176,6 @@ Resources:
                               # アクセスキー未使用の場合、作成日をチェック
                               create_date = key['CreateDate']
                               print(f"アクセスキー作成日: {create_date}")
-                              print(f"アクセスキー作成日の型: {type(create_date)}")
-                              print(f"アクセスキー作成日の値: {create_date}")
                               if create_date > cutoff_date:
                                   print(f"アクセスキー作成日内: {user_name}")
                                   access_key_valid = True
