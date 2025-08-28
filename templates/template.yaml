@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Detect unused IAM users with custom Lambda Config rule and auto-remediate excluding specific IAM users
+
+Parameters:
+  ExcludedUsersParameterName:
+    Type: String
+    Default: "/iam-unused-user-cleanup/excluded-users"
+    Description: SSM Parameter Store path for excluded IAM users list
+  
+  MaxCredentialUsageAge:
+    Type: String
+    Default: "30"
+    Description: Maximum number of days a credential can be unused before being revoked
+
+Resources:
+
+  # カスタムLambda Config規則用の実行ロール
+  ConfigRuleLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ConfigRuleLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+      Policies:
+        - PolicyName: IAMReadAndParameterAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:ListUsers
+                  - iam:GetUser
+                  - iam:GetLoginProfile
+                  - iam:ListAccessKeys
+                  - iam:GetAccessKeyLastUsed
+                  - ssm:GetParameter
+                Resource: "*"
+
+  # カスタムLambda Config規則
+  ConfigRuleLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: custom-unused-iam-user-credentials-check-function
+      Runtime: python3.13
+      Timeout: 300
+      MemorySize: 256
+      Handler: index.lambda_handler
+      Role: !GetAtt ConfigRuleLambdaRole.Arn
+      Environment:
+        Variables:
+          EXCLUDED_USERS_PARAMETER: !Ref ExcludedUsersParameterName
+          MAX_CREDENTIAL_AGE: !Ref MaxCredentialUsageAge
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          from datetime import datetime, timedelta, timezone
+          
+          iam = boto3.client('iam')
+          ssm = boto3.client('ssm')
+          config_client = boto3.client('config')
+          
+          def lambda_handler(event, context):
+              evaluations = []
+              excluded_users = get_excluded_users()
+              max_days = int(os.environ.get('MAX_CREDENTIAL_AGE', '90'))
+              
+              # 全IAMユーザーを取得して評価
+              paginator = iam.get_paginator('list_users')
+              for page in paginator.paginate():
+                  for user in page['Users']:
+                      user_name = user['UserName']
+                      print(f"評価中: {user_name}")
+                      
+                      if user_name in excluded_users:
+                          compliance = 'COMPLIANT'
+                          print(f"除外ユーザー: {user_name}")
+                      elif is_credentials_unused(user_name, max_days):
+                          compliance = 'NON_COMPLIANT'
+                          print(f"未使用ユーザー: {user_name}")
+                      else:
+                          compliance = 'COMPLIANT'
+                          print(f"使用中ユーザー: {user_name}")
+                      
+                      evaluations.append({
+                          'ComplianceResourceType': 'AWS::IAM::User',
+                          'ComplianceResourceId': user['UserId'],
+                          'ComplianceType': compliance,
+                          'OrderingTimestamp': datetime.now()
+                      })
+              
+              # Config に評価結果を送信
+              if evaluations:
+                  config_client.put_evaluations(
+                      Evaluations=evaluations,
+                      ResultToken=event['resultToken']
+                  )
+              
+              print(f"評価完了: {len(evaluations)}ユーザー")
+              return {'evaluations_count': len(evaluations)}
+          
+          def get_excluded_users():
+              parameter_name = os.environ.get('EXCLUDED_USERS_PARAMETER', '')
+              if not parameter_name:
+                  return []
+              
+              try:
+                  response = ssm.get_parameter(Name=parameter_name, WithDecryption=False)
+                  return [u.strip() for u in response['Parameter']['Value'].split(',') if u.strip()]
+              except ssm.exceptions.ParameterNotFound:
+                  print(f"除外リストパラメータが見つかりません: {parameter_name}")
+                  return []
+          
+          def is_credentials_unused(user_name, max_days):
+              cutoff_date = datetime.now() - timedelta(days=max_days)
+              print(f"カットオフ日: {cutoff_date}")
+              
+              password_valid = False
+              access_key_valid = False
+              
+              # パスワード使用チェック
+              user_info = iam.get_user(UserName=user_name)
+              if 'PasswordLastUsed' in user_info['User']:
+                  last_used = user_info['User']['PasswordLastUsed']
+                  print(f"パスワード最終使用: {last_used}")
+                  if last_used > cutoff_date:
+                      print(f"パスワード使用中: {user_name}")
+                      password_valid = True
+              else:
+                  # パスワード未使用の場合、作成日をチェック
+                  try:
+                      login_profile = iam.get_login_profile(UserName=user_name)
+                      create_date = login_profile['LoginProfile']['CreateDate']
+                      print(f"パスワード作成日: {create_date}")
+                      if create_date > cutoff_date:
+                          print(f"パスワード作成日内: {user_name}")
+                          password_valid = True
+                  except iam.exceptions.NoSuchEntityException:
+                      print(f"ログインプロファイルなし: {user_name}")
+                      password_valid = True  # パスワードがない場合は有効とみなす
+              
+              # アクセスキー使用チェック
+              access_keys = iam.list_access_keys(UserName=user_name)
+              if not access_keys['AccessKeyMetadata']:
+                  access_key_valid = True  # アクセスキーがない場合は有効とみなす
+                  print(f"アクセスキーなし: {user_name}")
+              else:
+                  # アクティブキーの存在確認
+                  active_keys = [key for key in access_keys['AccessKeyMetadata'] if key['Status'] == 'Active']
+                  if not active_keys:
+                      access_key_valid = True  # 全キーInactive = 対象外
+                      print(f"全キーInactive: {user_name}")
+                  else:
+                      for key in active_keys:
+                          key_usage = iam.get_access_key_last_used(AccessKeyId=key['AccessKeyId'])
+                          if 'LastUsedDate' in key_usage['AccessKeyLastUsed']:
+                              last_used = key_usage['AccessKeyLastUsed']['LastUsedDate']
+                              print(f"アクセスキー最終使用: {last_used}")
+                              if last_used > cutoff_date:
+                                  print(f"アクセスキー使用中: {user_name}")
+                                  access_key_valid = True
+                                  break
+                          else:
+                              # アクセスキー未使用の場合、作成日をチェック
+                              create_date = key['CreateDate']
+                              print(f"アクセスキー作成日: {create_date}")
+                              if create_date > cutoff_date:
+                                  print(f"アクセスキー作成日内: {user_name}")
+                                  access_key_valid = True
+                                  break
+                              print(f"アクセスキー未使用: {key['AccessKeyId']}")
+              
+              # AND条件: 両方とも有効でない場合はNON_COMPLIANT
+              result = not (password_valid and access_key_valid)
+              print(f"パスワード有効: {password_valid}, アクセスキー有効: {access_key_valid}, 未使用判定: {result}")
+              return result
+
+  # Lambdaに対するConfig権限
+  ConfigRuleLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ConfigRuleLambda
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # カスタムConfig規則
+  ConfigRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRuleLambdaPermission
+    Properties:
+      ConfigRuleName: custom-unused-iam-user-credentials-check
+      Description: "Detect IAM users with unused credentials (excluding specified users)"
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt ConfigRuleLambda.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ScheduledNotification
+            MaximumExecutionFrequency: TwentyFour_Hours
+      Scope:
+        ComplianceResourceTypes:
+          - "AWS::IAM::User"
+
+  # Config Remediation用のサービスロール
+  RemediationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ConfigRemediationServiceRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IAMUserManagementPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - config:ListDiscoveredResources
+                  - ssm:GetAutomationExecution
+                  - iam:DeleteAccessKey
+                  - ssm:StartAutomationExecution
+                  - iam:GetAccessKeyLastUsed
+                  - iam:UpdateAccessKey
+                  - iam:GetUser
+                  - iam:GetLoginProfile
+                  - iam:DeleteLoginProfile
+                  - iam:ListAccessKeys
+                Resource: "*"
+
+  # Config Remediation設定
+  RemediationConfiguration:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref ConfigRule
+      TargetType: SSM_DOCUMENT
+      TargetId: AWSConfigRemediation-RevokeUnusedIAMUserCredentials
+      TargetVersion: "1"
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt RemediationServiceRole.Arn
+        IAMResourceId:
+          ResourceValue:
+            Value: RESOURCE_ID
+        MaxCredentialUsageAge:
+          StaticValue:
+            Values:
+              - !Ref MaxCredentialUsageAge
+      Automatic: true
+      MaximumAutomaticAttempts: 5
+      RetryAttemptSeconds: 60
+
